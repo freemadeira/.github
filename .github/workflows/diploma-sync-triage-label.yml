@@ -1,0 +1,96 @@
+---
+name: Sync Triage Label with Project Status
+
+on:
+  # Trigger when a project item changes or is added
+  projects_v2_item:
+    types:
+      - created
+      - edited
+      - converted
+  # Optional: keep in sync if labels are manually changed
+  issues:
+    types:
+      - labeled
+      - unlabeled
+      - reopened
+      - opened
+  workflow_dispatch:  # manual trigger if you want to test it
+
+jobs:
+  sync-label:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      projects: read
+      contents: read
+    steps:
+      - name: Sync triage label with Project status
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PROJECT_TOKEN || secrets.GITHUB_TOKEN }}
+          script: |-
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            // Determine issue number depending on the event type
+            let issueNumber;
+            if (context.payload.issue) {
+              issueNumber = context.payload.issue.number;
+            } else if (context.payload.projects_v2_item?.content?.number) {
+              issueNumber = context.payload.projects_v2_item.content.number;
+            }
+            if (!issueNumber) {
+              console.log("No issue number found in event payload.");
+              return;
+            }
+            console.log(`Processing issue  #${issueNumber}`);
+            const query = `
+              query($owner: String!, $repo: String!, $issueNumber: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  issue(number: $issueNumber) {
+                    projectItems(first: 10) {
+                      nodes {
+                        fieldValues(first: 20) {
+                          nodes {
+                            ... on ProjectV2ItemFieldSingleSelectValue {
+                              field {
+                                ... on ProjectV2FieldCommon {
+                                  name
+                                }
+                              }
+                              name
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+            const result = await github.graphql(query, { owner, repo, issueNumber });
+            const projectItems = result.repository.issue.projectItems.nodes;
+            const hasTriageStatus = projectItems.some(item =>
+              item.fieldValues.nodes.some(
+                f => f.field?.name === 'Status' && f.name === 'Triage'
+              )
+            );
+            const issue = await github.rest.issues.get({ owner, repo, issue_number: issueNumber });
+            const hasTriageLabel = issue.data.labels.some(l => l.name === 'triage');
+            if (hasTriageStatus && !hasTriageLabel) {
+              await github.rest.issues.addLabels({
+                owner, repo,
+                issue_number: issueNumber,
+                labels: ['triage']
+              });
+              console.log(`✅ Added triage label to  #${issueNumber}`);
+            } else if (!hasTriageStatus && hasTriageLabel) {
+              await github.rest.issues.removeLabel({
+                owner, repo,
+                issue_number: issueNumber,
+                name: 'triage'
+              });
+              console.log(`❌ Removed triage label from  #${issueNumber}`);
+            } else {
+              console.log(`No change needed for  #${issueNumber}`);
+            }
